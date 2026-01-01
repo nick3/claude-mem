@@ -125,7 +125,10 @@ export class OpenAICompatibleAgent {
    */
   private shouldFallbackToClaude(error: any): boolean {
     const message = error?.message || '';
-    // Fall back on rate limit (429), server errors (5xx), or network issues
+    const name = error?.name || '';
+    const lowerMessage = typeof message === 'string' ? message.toLowerCase() : '';
+
+    // Fall back on rate limit (429), server errors (5xx), timeouts, or network issues
     return (
       message.includes('429') ||
       message.includes('500') ||
@@ -133,7 +136,9 @@ export class OpenAICompatibleAgent {
       message.includes('503') ||
       message.includes('ECONNREFUSED') ||
       message.includes('ETIMEDOUT') ||
-      message.includes('fetch failed')
+      message.includes('fetch failed') ||
+      name === 'AbortError' ||
+      lowerMessage.includes('timeout')
     );
   }
 
@@ -307,6 +312,27 @@ export class OpenAICompatibleAgent {
     return Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE);
   }
 
+
+  private async fetchWithTimeout(
+    requestUrl: string,
+    options: RequestInit,
+    timeoutMs: number = 60000
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      return await fetch(requestUrl, { ...options, signal: controller.signal });
+    } catch (error: any) {
+      if (error?.name === 'AbortError') {
+        throw new Error(`OpenAI-compatible request timed out after ${timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
   /**
    * Truncate conversation history to prevent runaway context costs
    * Keeps most recent messages within token budget
@@ -436,20 +462,24 @@ export class OpenAICompatibleAgent {
           : {})
       });
 
-      const response = await fetch(requestUrl, {
-        method: 'POST',
-        headers: {
-          ...(extraHeaders || {}),
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
+      const response = await this.fetchWithTimeout(
+        requestUrl,
+        {
+          method: 'POST',
+          headers: {
+            ...(extraHeaders || {}),
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            temperature: 0.3,
+            max_tokens: maxOutputTokens,
+          }),
         },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature: 0.3,
-          max_tokens: maxOutputTokens,
-        }),
-      });
+        120000
+      );
 
       if (response.ok) {
         const data = (await response.json()) as OpenAICompatibleResponse;
@@ -794,7 +824,7 @@ export class OpenAICompatibleAgent {
     extraHeaders: Record<string, string> | undefined,
     maxTokens: number
   ): Promise<string> {
-    const response = await fetch(requestUrl, {
+    const response = await this.fetchWithTimeout(requestUrl, {
       method: 'POST',
       headers: {
         ...(extraHeaders || {}),
