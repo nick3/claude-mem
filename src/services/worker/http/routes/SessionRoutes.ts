@@ -135,21 +135,22 @@ export class SessionRoutes extends BaseRouteHandler {
   ): void {
     if (!session) return;
 
-    const agent = provider === 'openrouter'
-      ? this.openRouterAgent
-      : (provider === 'openai-compatible'
-        ? this.openAICompatibleAgent
-        : (provider === 'gemini'
-          ? this.geminiAgent
-          : this.sdkAgent));
+    let agent: SDKAgent | GeminiAgent | OpenRouterAgent | OpenAICompatibleAgent;
+    let agentName: string;
 
-    const agentName = provider === 'openrouter'
-      ? 'OpenRouter'
-      : (provider === 'openai-compatible'
-        ? 'OpenAI Compatible'
-        : (provider === 'gemini'
-          ? 'Gemini'
-          : 'Claude SDK'));
+    if (provider === 'openrouter') {
+      agent = this.openRouterAgent;
+      agentName = 'OpenRouter';
+    } else if (provider === 'openai-compatible') {
+      agent = this.openAICompatibleAgent;
+      agentName = 'OpenAI Compatible';
+    } else if (provider === 'gemini') {
+      agent = this.geminiAgent;
+      agentName = 'Gemini';
+    } else {
+      agent = this.sdkAgent;
+      agentName = 'Claude SDK';
+    }
 
     logger.info('SESSION', `Generator auto-starting (${source}) using ${agentName}`, {
       sessionId: session.sessionDbId,

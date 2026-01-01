@@ -66,7 +66,7 @@ export interface OpenAICompatibleProfile {
   apiKey?: string;
   model: string;
   headers?: Record<string, string>;
-  maxContextTokens?: number;
+  maxContextTokens?: number | string;
 }
 
 // Forward declaration for fallback agent type
@@ -89,7 +89,16 @@ function pickActiveProfile(
   activeId: string
 ): OpenAICompatibleProfile | null {
   if (profiles.length === 0) return null;
+
   const selected = profiles.find(p => p && p.id === activeId);
+
+  if (!selected && activeId && profiles.length > 0) {
+    logger.warn('CONFIG', `Active profile '${activeId}' not found, falling back to first profile`, {
+      activeId,
+      availableProfiles: profiles.map(p => p.id)
+    });
+  }
+
   return selected || profiles[0] || null;
 }
 
@@ -163,8 +172,8 @@ export class OpenAICompatibleAgent {
 
         // Track token usage
         const tokensUsed = initResponse.tokensUsed || 0;
-        session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-        session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+        session.cumulativeInputTokens += initResponse.promptTokens ?? Math.floor(tokensUsed * 0.7);
+        session.cumulativeOutputTokens += initResponse.completionTokens ?? Math.floor(tokensUsed * 0.3);
 
         // Process response (no original timestamp for init - not from queue)
         await this.processProviderResponse(session, initResponse.content, worker, tokensUsed, null);
@@ -205,8 +214,8 @@ export class OpenAICompatibleAgent {
             session.conversationHistory.push({ role: 'assistant', content: obsResponse.content });
 
             const tokensUsed = obsResponse.tokensUsed || 0;
-            session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-            session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+            session.cumulativeInputTokens += obsResponse.promptTokens ?? Math.floor(tokensUsed * 0.7);
+            session.cumulativeOutputTokens += obsResponse.completionTokens ?? Math.floor(tokensUsed * 0.3);
             await this.processProviderResponse(session, obsResponse.content, worker, tokensUsed, originalTimestamp);
           } else {
             // Empty response - still mark messages as processed to avoid stuck state
@@ -237,8 +246,8 @@ export class OpenAICompatibleAgent {
             session.conversationHistory.push({ role: 'assistant', content: summaryResponse.content });
 
             const tokensUsed = summaryResponse.tokensUsed || 0;
-            session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-            session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+            session.cumulativeInputTokens += summaryResponse.promptTokens ?? Math.floor(tokensUsed * 0.7);
+            session.cumulativeOutputTokens += summaryResponse.completionTokens ?? Math.floor(tokensUsed * 0.3);
             await this.processProviderResponse(session, summaryResponse.content, worker, tokensUsed, originalTimestamp);
           } else {
             // Empty response - still mark messages as processed to avoid stuck state
@@ -376,7 +385,7 @@ export class OpenAICompatibleAgent {
     model: string,
     extraHeaders?: Record<string, string>,
     maxContextTokens?: number
-  ): Promise<{ content: string; tokensUsed?: number }> {
+  ): Promise<{ content: string; tokensUsed?: number; promptTokens?: number; completionTokens?: number }> {
     const budgetingEnabled = typeof maxContextTokens === 'number' && Number.isFinite(maxContextTokens) && maxContextTokens > 0;
 
     let effectiveMaxContextTokens = maxContextTokens ?? DEFAULT_MAX_ESTIMATED_TOKENS;
@@ -466,7 +475,12 @@ export class OpenAICompatibleAgent {
           });
         }
 
-        return { content, tokensUsed };
+        return {
+          content,
+          tokensUsed,
+          promptTokens: data.usage?.prompt_tokens,
+          completionTokens: data.usage?.completion_tokens
+        };
       }
 
       const errorText = await response.text();
@@ -819,30 +833,38 @@ export class OpenAICompatibleAgent {
     discoveryTokens: number,
     originalTimestamp: number | null
   ): Promise<void> {
-    const store = this.dbManager.getSessionStore();
+    // Parse observations (same XML format as Claude/Gemini/OpenRouter)
+    const observations = parseObservations(text, session.contentSessionId);
 
-    // Parse observations
-    const observations = parseObservations(text);
+    // Store observations with original timestamp (if processing backlog) or current time
     for (const obs of observations) {
-      const createdAtEpoch = originalTimestamp ?? Date.now();
-      const observationId = store.storeObservation({
-        memory_session_id: session.memorySessionId!,
-        project: session.project,
+      const { id: obsId, createdAtEpoch } = this.dbManager.getSessionStore().storeObservation(
+        session.contentSessionId,
+        session.project,
+        obs,
+        session.lastPromptNumber,
+        discoveryTokens,
+        originalTimestamp ?? undefined
+      );
+
+      logger.info('SDK', 'OpenAI-compatible observation saved', {
+        sessionId: session.sessionDbId,
+        obsId,
         type: obs.type,
-        title: obs.title,
-        subtitle: obs.subtitle,
-        text: obs.text,
-        concepts: obs.concepts,
-        files: obs.files,
-        prompt_number: session.lastPromptNumber,
-        created_at_epoch: createdAtEpoch,
-        read_tokens: 0,
-        work_tokens: discoveryTokens
+        title: obs.title || '(untitled)'
       });
 
-      // Sync to Chroma (async)
-      this.dbManager.getChromaSync()?.syncObservation(observationId).catch(err => {
-        logger.debug('CHROMA', 'Failed to sync observation', { id: observationId }, err);
+      // Sync to Chroma
+      this.dbManager.getChromaSync()?.syncObservation(
+        obsId,
+        session.contentSessionId,
+        session.project,
+        obs,
+        session.lastPromptNumber,
+        createdAtEpoch,
+        discoveryTokens
+      ).catch(err => {
+        logger.warn('SDK', 'OpenAI-compatible chroma sync failed', { obsId }, err);
       });
 
       // Broadcast to SSE clients
@@ -850,41 +872,66 @@ export class OpenAICompatibleAgent {
         worker.sseBroadcaster.broadcast({
           type: 'new_observation',
           observation: {
-            id: observationId,
-            memory_session_id: session.memorySessionId!,
-            project: session.project,
+            id: obsId,
+            memory_session_id: session.memorySessionId,
+            session_id: session.contentSessionId,
             type: obs.type,
             title: obs.title,
             subtitle: obs.subtitle,
-            narrative: obs.text,
-            text: obs.text,
-            facts: null,
-            concepts: obs.concepts.join(','),
-            files_read: obs.files.join(','),
-            files_modified: null,
+            text: null,
+            narrative: obs.narrative || null,
+            facts: JSON.stringify(obs.facts || []),
+            concepts: JSON.stringify(obs.concepts || []),
+            files_read: JSON.stringify(obs.files_read || []),
+            files_modified: JSON.stringify(obs.files_modified || []),
+            project: session.project,
             prompt_number: session.lastPromptNumber,
-            created_at_epoch: createdAtEpoch,
-            created_at: new Date(createdAtEpoch).toISOString(),
+            created_at_epoch: createdAtEpoch
           }
         });
       }
     }
 
-    // Parse and store summary if present
-    const summary = parseSummary(text);
+    // Parse summary
+    const summary = parseSummary(text, session.sessionDbId);
+
     if (summary) {
-      const createdAtEpoch = originalTimestamp ?? Date.now();
-      const summaryId = store.storeSummary({
-        memory_session_id: session.memorySessionId!,
-        project: session.project,
-        request: summary.request,
-        investigated: summary.investigated,
-        learned: summary.learned,
-        completed: summary.completed,
-        next_steps: summary.next_steps,
-        notes: summary.notes,
-        prompt_number: session.lastPromptNumber,
-        created_at_epoch: createdAtEpoch
+      // Convert nullable fields to empty strings for storeSummary
+      const summaryForStore = {
+        request: summary.request || '',
+        investigated: summary.investigated || '',
+        learned: summary.learned || '',
+        completed: summary.completed || '',
+        next_steps: summary.next_steps || '',
+        notes: summary.notes
+      };
+
+      const { id: summaryId, createdAtEpoch } = this.dbManager.getSessionStore().storeSummary(
+        session.contentSessionId,
+        session.project,
+        summaryForStore,
+        session.lastPromptNumber,
+        discoveryTokens,
+        originalTimestamp ?? undefined
+      );
+
+      logger.info('SDK', 'OpenAI-compatible summary saved', {
+        sessionId: session.sessionDbId,
+        summaryId,
+        request: summary.request || '(no request)'
+      });
+
+      // Sync to Chroma
+      this.dbManager.getChromaSync()?.syncSummary(
+        summaryId,
+        session.contentSessionId,
+        session.project,
+        summaryForStore,
+        session.lastPromptNumber,
+        createdAtEpoch,
+        discoveryTokens
+      ).catch(err => {
+        logger.warn('SDK', 'OpenAI-compatible chroma sync failed', { summaryId }, err);
       });
 
       // Broadcast to SSE clients
@@ -967,7 +1014,7 @@ export class OpenAICompatibleAgent {
       ? profile.headers
       : {};
 
-    const rawMaxContextTokens = (profile as any).maxContextTokens;
+    const rawMaxContextTokens = profile.maxContextTokens;
     const maxContextTokens = typeof rawMaxContextTokens === 'number'
       ? rawMaxContextTokens
       : (typeof rawMaxContextTokens === 'string' && /^\d+$/.test(rawMaxContextTokens)
